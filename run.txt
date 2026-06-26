@@ -1,0 +1,11 @@
+cd D:\VIRTUALHERD_PRODUCTION\backend
+venv\Scripts\activate
+python app.py
+
+cd D:\VIRTUALHERD_PRODUCTION\web
+python -m http.server 8080
+
+website url:http://localhost:8080/dashboard.html
+
+to add a cattle using cmd to show in webpage directly:
+curl -X POST http://localhost:5000/api/cattle -H "Content-Type: application/json" -d "{\"cattle_id\": 1}"
