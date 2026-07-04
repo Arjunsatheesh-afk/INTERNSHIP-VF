@@ -7,7 +7,7 @@ import {
 import axios from 'axios';
 import { io } from 'socket.io-client';
 
-const BACKEND = 'http://192.168.1.15:5000';
+const BACKEND = 'http://192.168.1.8:5000';
 const { width, height } = Dimensions.get('window');
 
 const C = {

@@ -1,7 +1,6 @@
 """
-VIRTUALHERD+ BACKEND - PRODUCTION VERSION
+VIRTUALHERD+ BACKEND - PRODUCTION VERSION WITH SQLITE PERSISTENCE
 Flask Application with Ensemble ML Model (99.99% Accuracy)
-Health Monitoring & Cattle Management System
 """
 
 from flask import Flask, jsonify, request
@@ -9,6 +8,8 @@ from flask_socketio import SocketIO
 from flask_cors import CORS
 import threading
 import time
+import sqlite3
+import json
 from datetime import datetime
 from services.cattle_service import get_cattle_service
 from services.data_loader import get_data_loader
@@ -18,7 +19,6 @@ import numpy as np
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'virtualherd-secret-key-2024'
-
 socketio = SocketIO(app, cors_allowed_origins="*")
 CORS(app)
 
@@ -34,8 +34,7 @@ try:
     print(f"[ML] ✓ Health Classes: {list(health_label_encoder.classes_)}")
     ensemble_model_loaded = True
 except Exception as e:
-    print(f"[ML] ⚠ Fallback: Using rule-based health detection")
-    print(f"[ML] Error: {e}")
+    print(f"[ML] ⚠ Fallback: {e}")
     ensemble_model_loaded = False
     health_model = None
     health_label_encoder = None
@@ -46,7 +45,71 @@ training_day = 1
 alerts = []
 
 # ============================================================================
-# HEALTH PREDICTION
+# SQLITE DATABASE
+# ============================================================================
+
+DB_PATH = 'virtualherd.db'
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Farmer paddocks table
+    c.execute('''CREATE TABLE IF NOT EXISTS farmer_paddocks (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        points TEXT DEFAULT '[]',
+        cattle_ids TEXT DEFAULT '[]',
+        status TEXT DEFAULT 'available',
+        grass_quality INTEGER DEFAULT 80,
+        created TEXT
+    )''')
+    
+    # Persisted cattle table
+    c.execute('''CREATE TABLE IF NOT EXISTS active_cattle (
+        cattle_id INTEGER PRIMARY KEY,
+        added_at TEXT
+    )''')
+
+    # Schedules table
+    c.execute('''CREATE TABLE IF NOT EXISTS schedules (
+        id TEXT PRIMARY KEY,
+        paddock_id TEXT,
+        paddock_name TEXT,
+        cattle_ids TEXT DEFAULT '[]',
+        start_time TEXT,
+        end_time TEXT,
+        notes TEXT,
+        created TEXT
+    )''')
+
+    conn.commit()
+    conn.close()
+    print("[DB] ✓ SQLite database initialized")
+
+init_db()
+
+# ============================================================================
+# RESTORE CATTLE FROM DB ON STARTUP
+# ============================================================================
+
+def restore_cattle():
+    conn = get_db()
+    rows = conn.execute('SELECT cattle_id FROM active_cattle').fetchall()
+    conn.close()
+    for row in rows:
+        cattle_service.add_cattle(row['cattle_id'])
+    print(f"[DB] ✓ Restored {len(rows)} cattle from database")
+
+restore_cattle()
+
+# ============================================================================
+# ML PREDICTION
 # ============================================================================
 
 def predict_health_status(cattle_obj):
@@ -87,9 +150,7 @@ def predict_health_status(cattle_obj):
         health_status = health_label_encoder.inverse_transform([prediction])[0]
         return str(health_status), round(confidence, 3)
     except Exception as e:
-        print(f"[ML] Error in prediction: {e}")
         return predict_health_rule_based(cattle_obj)
-
 
 def predict_health_rule_based(cattle_obj):
     temp = float(cattle_obj.temperature)
@@ -134,13 +195,14 @@ def add_cattle():
     if cattle:
         health_status, confidence = predict_health_status(cattle)
         cattle.health_status = health_status
+        # Persist to DB
+        conn = get_db()
+        conn.execute('INSERT OR IGNORE INTO active_cattle (cattle_id, added_at) VALUES (?, ?)',
+                     (cattle_id, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
         socketio.emit('cattle_added', {'cattle': cattle.to_dict()}, to=None)
-        return jsonify({
-            'status': 'success',
-            'message': f'Cattle {cattle_id} added',
-            'health_status': health_status,
-            'cattle': cattle.to_dict()
-        }), 201
+        return jsonify({'status': 'success', 'message': f'Cattle {cattle_id} added', 'cattle': cattle.to_dict()}), 201
     else:
         return jsonify({'error': f'Failed to add cattle {cattle_id}'}), 400
 
@@ -148,6 +210,11 @@ def add_cattle():
 def remove_cattle(cattle_id):
     success = cattle_service.remove_cattle(cattle_id)
     if success:
+        # Remove from DB
+        conn = get_db()
+        conn.execute('DELETE FROM active_cattle WHERE cattle_id = ?', (cattle_id,))
+        conn.commit()
+        conn.close()
         socketio.emit('cattle_removed', {'cattle_id': cattle_id}, to=None)
         return jsonify({'status': 'success', 'message': f'Cattle {cattle_id} removed'})
     else:
@@ -163,7 +230,7 @@ def get_available_cattle():
     })
 
 # ============================================================================
-# HEALTH & ALERTS ENDPOINTS
+# HEALTH & ALERTS
 # ============================================================================
 
 @app.route('/api/health', methods=['GET'])
@@ -173,186 +240,145 @@ def get_health_status():
         **health,
         'alerts': len(alerts),
         'alert_summary': alerts[-10:] if alerts else [],
-        'model_accuracy': '99.99%' if ensemble_model_loaded else '~98% (rule-based)',
+        'model_accuracy': '99.99%' if ensemble_model_loaded else '~98%',
         'model_type': 'Ensemble (RF+XGB+GB)' if ensemble_model_loaded else 'Rule-based'
     })
 
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts_route():
     current_alerts = cattle_service.get_alerts()
-    return jsonify({
-        'alerts': current_alerts,
-        'count': len(current_alerts),
-        'critical': len([a for a in current_alerts if a['severity'] == 'critical'])
-    })
+    return jsonify({'alerts': current_alerts, 'count': len(current_alerts)})
 
 # ============================================================================
-# PADDOCKS ENDPOINTS
+# FARMER PADDOCKS (SQLITE PERSISTED)
 # ============================================================================
 
-@app.route('/api/paddocks', methods=['GET'])
-def get_paddocks():
-    all_cattle = cattle_service.get_all_cattle()
-    north_cattle = len([c for c in all_cattle if c.x < 50 and c.y < 50])
-    south_cattle = len([c for c in all_cattle if c.x >= 50 and c.y < 50])
-    east_cattle = len([c for c in all_cattle if c.x >= 50 and c.y >= 50])
-    west_cattle = len([c for c in all_cattle if c.x < 50 and c.y >= 50])
+@app.route('/api/farmer/paddocks', methods=['GET'])
+def get_farmer_paddocks():
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM farmer_paddocks').fetchall()
+    conn.close()
+    paddocks = []
+    for row in rows:
+        p = dict(row)
+        p['points'] = json.loads(p['points'] or '[]')
+        p['cattle_ids'] = json.loads(p['cattle_ids'] or '[]')
+        paddocks.append(p)
+    return jsonify({'paddocks': paddocks, 'count': len(paddocks)})
 
-    paddocks = [
-        {
-            'id': 'P1',
-            'name': 'North Field',
-            'area_hectares': 2.5,
-            'grass_quality': 85,
-            'grass_available_kg': 450,
-            'cattle_count': north_cattle,
-            'capacity': 20,
-            'status': 'available',
-            'days_resting': 0,
-            'recommended': False
-        },
-        {
-            'id': 'P2',
-            'name': 'South Field',
-            'area_hectares': 2.0,
-            'grass_quality': 72,
-            'grass_available_kg': 380,
-            'cattle_count': south_cattle,
-            'capacity': 18,
-            'status': 'occupied',
-            'days_resting': 0,
-            'recommended': False
-        },
-        {
-            'id': 'P3',
-            'name': 'East Pasture',
-            'area_hectares': 3.0,
-            'grass_quality': 90,
-            'grass_available_kg': 520,
-            'cattle_count': east_cattle,
-            'capacity': 25,
-            'status': 'available',
-            'days_resting': 7,
-            'recommended': True
-        },
-        {
-            'id': 'P4',
-            'name': 'West Pasture',
-            'area_hectares': 1.8,
-            'grass_quality': 65,
-            'grass_available_kg': 290,
-            'cattle_count': west_cattle,
-            'capacity': 15,
-            'status': 'recovering',
-            'days_resting': 3,
-            'recommended': False
-        }
-    ]
-    return jsonify({
-        'paddocks': paddocks,
-        'count': len(paddocks),
-        'total_cattle': cattle_service.get_cattle_count(),
-        'timestamp': datetime.now().isoformat()
-    })
+@app.route('/api/farmer/paddocks', methods=['POST'])
+def create_farmer_paddock():
+    data = request.json
+    conn = get_db()
+    rows = conn.execute('SELECT COUNT(*) as cnt FROM farmer_paddocks').fetchone()
+    paddock_id = f"FP{rows['cnt'] + 1}"
+    points = data.get('points', [])
+    now = datetime.now().isoformat()
+    conn.execute(
+        'INSERT INTO farmer_paddocks (id, name, points, cattle_ids, status, grass_quality, created) VALUES (?,?,?,?,?,?,?)',
+        (paddock_id, data.get('name', paddock_id), json.dumps(points), '[]', 'available', 80, now)
+    )
+    conn.commit()
+    paddock = dict(conn.execute('SELECT * FROM farmer_paddocks WHERE id=?', (paddock_id,)).fetchone())
+    conn.close()
+    paddock['points'] = json.loads(paddock['points'])
+    paddock['cattle_ids'] = json.loads(paddock['cattle_ids'])
+    socketio.emit('paddock_created', {'paddock': paddock}, to=None)
+    return jsonify({'status': 'success', 'paddock': paddock}), 201
 
-@app.route('/api/paddocks/<paddock_id>', methods=['GET'])
-def get_paddock(paddock_id):
-    paddock_data = {
-        'P1': {'id': 'P1', 'name': 'North Field', 'grass_quality': 85, 'status': 'available'},
-        'P2': {'id': 'P2', 'name': 'South Field', 'grass_quality': 72, 'status': 'occupied'},
-        'P3': {'id': 'P3', 'name': 'East Pasture', 'grass_quality': 90, 'status': 'available'},
-        'P4': {'id': 'P4', 'name': 'West Pasture', 'grass_quality': 65, 'status': 'recovering'}
-    }
-    if paddock_id in paddock_data:
-        return jsonify(paddock_data[paddock_id])
-    return jsonify({'error': 'Paddock not found'}), 404
+@app.route('/api/farmer/paddocks/<paddock_id>/assign', methods=['POST'])
+def assign_cattle_to_paddock(paddock_id):
+    data = request.json
+    cattle_ids = data.get('cattle_ids', [])
+    conn = get_db()
+    row = conn.execute('SELECT * FROM farmer_paddocks WHERE id=?', (paddock_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'error': 'Paddock not found'}), 404
+    status = 'occupied' if cattle_ids else 'available'
+    conn.execute('UPDATE farmer_paddocks SET cattle_ids=?, status=? WHERE id=?',
+                 (json.dumps(cattle_ids), status, paddock_id))
+    conn.commit()
+    paddock = dict(conn.execute('SELECT * FROM farmer_paddocks WHERE id=?', (paddock_id,)).fetchone())
+    conn.close()
+    paddock['points'] = json.loads(paddock['points'])
+    paddock['cattle_ids'] = json.loads(paddock['cattle_ids'])
+    socketio.emit('paddock_updated', {'paddock': paddock}, to=None)
+    return jsonify({'status': 'success', 'paddock': paddock})
+
+@app.route('/api/farmer/paddocks/<paddock_id>', methods=['DELETE'])
+def delete_farmer_paddock(paddock_id):
+    conn = get_db()
+    conn.execute('DELETE FROM farmer_paddocks WHERE id=?', (paddock_id,))
+    conn.commit()
+    conn.close()
+    socketio.emit('paddock_deleted', {'paddock_id': paddock_id}, to=None)
+    return jsonify({'status': 'success'})
 
 # ============================================================================
-# SCHEDULE ENDPOINTS
+# SCHEDULES (SQLITE PERSISTED)
 # ============================================================================
 
-@app.route('/api/schedule', methods=['GET'])
-def get_schedule():
-    cattle_count = cattle_service.get_cattle_count()
-    schedule = [
-        {
-            'day': 0,
-            'name': 'Today',
-            'paddock_id': 'P1',
-            'paddock_name': 'North Field',
-            'cattle_count': cattle_count,
-            'duration_hours': 24,
-            'grass_available': 450,
-            'grass_quality': 85
-        },
-        {
-            'day': 1,
-            'name': 'Tomorrow',
-            'paddock_id': 'P2',
-            'paddock_name': 'South Field',
-            'cattle_count': cattle_count,
-            'duration_hours': 24,
-            'grass_available': 380,
-            'grass_quality': 72
-        },
-        {
-            'day': 2,
-            'name': 'Day 3',
-            'paddock_id': 'P3',
-            'paddock_name': 'East Pasture',
-            'cattle_count': cattle_count,
-            'duration_hours': 24,
-            'grass_available': 520,
-            'grass_quality': 90
-        },
-        {
-            'day': 3,
-            'name': 'Day 4',
-            'paddock_id': 'P4',
-            'paddock_name': 'West Pasture',
-            'cattle_count': cattle_count,
-            'duration_hours': 24,
-            'grass_available': 290,
-            'grass_quality': 65
-        }
-    ]
-    return jsonify({
-        'schedule': schedule,
-        'cycle_days': 28,
-        'current_day': training_day,
-        'recommended_next': 'P3',
-        'timestamp': datetime.now().isoformat()
-    })
+@app.route('/api/farmer/schedules', methods=['GET'])
+def get_schedules():
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM schedules ORDER BY start_time').fetchall()
+    conn.close()
+    schedules = []
+    for row in rows:
+        s = dict(row)
+        s['cattle_ids'] = json.loads(s['cattle_ids'] or '[]')
+        schedules.append(s)
+    return jsonify({'schedules': schedules, 'count': len(schedules)})
 
-@app.route('/api/schedule/recommend', methods=['GET'])
-def get_schedule_recommendation():
-    return jsonify({
-        'recommended_paddock': 'P3',
-        'paddock_name': 'East Pasture',
-        'reason': 'Highest grass quality (90%), rested 7 days, ready for grazing',
-        'ready_in_days': 0,
-        'estimated_duration_days': 4,
-        'cattle_count': cattle_service.get_cattle_count(),
-        'expected_grass_consumption_kg': 120
-    })
+@app.route('/api/farmer/schedules', methods=['POST'])
+def create_schedule():
+    data = request.json
+    conn = get_db()
+    rows = conn.execute('SELECT COUNT(*) as cnt FROM schedules').fetchone()
+    schedule_id = f"SCH{rows['cnt'] + 1}"
+    now = datetime.now().isoformat()
+    conn.execute(
+        'INSERT INTO schedules (id, paddock_id, paddock_name, cattle_ids, start_time, end_time, notes, created) VALUES (?,?,?,?,?,?,?,?)',
+        (schedule_id, data.get('paddock_id'), data.get('paddock_name'),
+         json.dumps(data.get('cattle_ids', [])),
+         data.get('start_time'), data.get('end_time'),
+         data.get('notes', ''), now)
+    )
+    conn.commit()
+    schedule = dict(conn.execute('SELECT * FROM schedules WHERE id=?', (schedule_id,)).fetchone())
+    conn.close()
+    schedule['cattle_ids'] = json.loads(schedule['cattle_ids'])
+    socketio.emit('schedule_created', {'schedule': schedule}, to=None)
+    return jsonify({'status': 'success', 'schedule': schedule}), 201
+
+@app.route('/api/farmer/schedules/<schedule_id>', methods=['DELETE'])
+def delete_schedule(schedule_id):
+    conn = get_db()
+    conn.execute('DELETE FROM schedules WHERE id=?', (schedule_id,))
+    conn.commit()
+    conn.close()
+    socketio.emit('schedule_deleted', {'schedule_id': schedule_id}, to=None)
+    return jsonify({'status': 'success'})
 
 # ============================================================================
-# STATUS & ML INFO ENDPOINTS
+# STATUS ENDPOINTS
 # ============================================================================
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
+    conn = get_db()
+    paddock_count = conn.execute('SELECT COUNT(*) as cnt FROM farmer_paddocks').fetchone()['cnt']
+    cattle_count = conn.execute('SELECT COUNT(*) as cnt FROM active_cattle').fetchone()['cnt']
+    conn.close()
     return jsonify({
         'status': 'running',
-        'version': 'Production (Ensemble Model)',
         'simulation_running': simulation_running,
         'cattle_count': cattle_service.get_cattle_count(),
         'available_cattle': len(cattle_service.get_available_cattle_ids()),
         'alerts': len(alerts),
         'training_day': training_day,
-        'paddocks': 4,
-        'paddocks_available': 2,
-        'schedule_active': True,
+        'paddocks': paddock_count,
         'ml_model': {
             'type': 'Ensemble (Random Forest + XGBoost + Gradient Boosting)',
             'status': 'loaded' if ensemble_model_loaded else 'fallback',
@@ -366,46 +392,18 @@ def get_status():
 
 @app.route('/api/ml/info', methods=['GET'])
 def get_ml_info():
-    if not ensemble_model_loaded:
-        return jsonify({'error': 'Model not loaded'}), 500
     return jsonify({
         'model_name': 'Ensemble Voting Classifier',
-        'components': [
-            'Random Forest (300 estimators, 99.98% accuracy)',
-            'XGBoost (300 rounds, 99.94% accuracy)',
-            'Gradient Boosting (200 estimators)'
-        ],
         'ensemble_accuracy': '99.99%',
         'features_used': 45,
-        'health_classes': {
-            'FEVER': 'Temperature > 39.5C',
-            'STRESS': 'Heart Rate > 100 BPM',
-            'HYPOTHERMIA': 'Temperature < 37.5C',
-            'HEALTHY': 'Normal baseline'
-        },
-        'top_features': [
-            'Heart Rate (27.72%)',
-            'Heat Stress (23.52%)',
-            'Skin Temperature (20.08%)',
-            'Pasture ID (5.60%)',
-            'GPS Temperature (4.66%)'
-        ],
-        'training_data': {
-            'total_samples': 96702,
-            'unique_cattle': 80
-        },
+        'health_classes': ['FEVER', 'STRESS', 'HYPOTHERMIA', 'HEALTHY'],
         'status': 'production-ready'
     })
 
 @app.route('/api/dataset', methods=['GET'])
 def get_dataset_info():
     summary = data_loader.get_dataset_summary()
-    return jsonify({
-        **summary,
-        'ml_features_used': 45,
-        'health_monitoring': True,
-        'pasture_analysis': True
-    })
+    return jsonify({**summary, 'ml_features_used': 45})
 
 # ============================================================================
 # WEBSOCKET EVENTS
@@ -416,9 +414,7 @@ def handle_connect():
     print(f"[WS] Client connected")
     socketio.emit('response', {
         'status': 'connected',
-        'message': 'Connected to VirtualHerd+ Backend (Ensemble Model)',
         'cattle_count': cattle_service.get_cattle_count(),
-        'ml_model': 'Ensemble (99.99%)',
         'timestamp': datetime.now().isoformat()
     })
 
@@ -430,7 +426,6 @@ def handle_disconnect():
 def handle_start():
     global simulation_running
     simulation_running = True
-    print("[WS] Simulation started")
     socketio.emit('response', {'status': 'Simulation started'}, to=None)
     start_simulation_loop()
 
@@ -438,7 +433,6 @@ def handle_start():
 def handle_stop():
     global simulation_running
     simulation_running = False
-    print("[WS] Simulation stopped")
     socketio.emit('response', {'status': 'Simulation stopped'}, to=None)
 
 def start_simulation_loop():
@@ -456,58 +450,12 @@ def start_simulation_loop():
                 'cattle': cattle_data,
                 'alerts': current_alerts,
                 'step': step,
-                'model': 'Ensemble (99.99%)',
                 'timestamp': datetime.now().isoformat()
             }, to=None)
             time.sleep(1)
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
-    
-# In-memory farmer paddock storage
-farmer_paddocks = {}
 
-@app.route('/api/farmer/paddocks', methods=['GET'])
-def get_farmer_paddocks():
-    return jsonify({
-        'paddocks': list(farmer_paddocks.values()),
-        'count': len(farmer_paddocks)
-    })
-
-@app.route('/api/farmer/paddocks', methods=['POST'])
-def create_farmer_paddock():
-    data = request.json
-    paddock_id = f"FP{len(farmer_paddocks) + 1}"
-    farmer_paddocks[paddock_id] = {
-        'id': paddock_id,
-        'name': data.get('name', paddock_id),
-        'points': data.get('points', []),
-        'cattle_ids': [],
-        'grass_quality': 80,
-        'area_hectares': round(len(data.get('points', [])) * 0.5, 1),
-        'status': 'available',
-        'created': datetime.now().isoformat()
-    }
-    socketio.emit('paddock_created', {'paddock': farmer_paddocks[paddock_id]}, to=None)
-    return jsonify({'status': 'success', 'paddock': farmer_paddocks[paddock_id]}), 201
-
-@app.route('/api/farmer/paddocks/<paddock_id>/assign', methods=['POST'])
-def assign_cattle_to_paddock(paddock_id):
-    data = request.json
-    cattle_ids = data.get('cattle_ids', [])
-    if paddock_id in farmer_paddocks:
-        farmer_paddocks[paddock_id]['cattle_ids'] = cattle_ids
-        farmer_paddocks[paddock_id]['status'] = 'occupied' if cattle_ids else 'available'
-        socketio.emit('paddock_updated', {'paddock': farmer_paddocks[paddock_id]}, to=None)
-        return jsonify({'status': 'success', 'paddock': farmer_paddocks[paddock_id]})
-    return jsonify({'error': 'Paddock not found'}), 404
-
-@app.route('/api/farmer/paddocks/<paddock_id>', methods=['DELETE'])
-def delete_farmer_paddock(paddock_id):
-    if paddock_id in farmer_paddocks:
-        deleted = farmer_paddocks.pop(paddock_id)
-        socketio.emit('paddock_deleted', {'paddock_id': paddock_id}, to=None)
-        return jsonify({'status': 'success'})
-    return jsonify({'error': 'Paddock not found'}), 404
 # ============================================================================
 # ERROR HANDLERS
 # ============================================================================
@@ -521,39 +469,29 @@ def server_error(error):
     return jsonify({'error': 'Internal server error'}), 500
 
 # ============================================================================
-# MAIN ENTRY POINT
+# MAIN
 # ============================================================================
 
 if __name__ == '__main__':
     print("\n" + "="*100)
-    print("VIRTUALHERD+ BACKEND - PRODUCTION (ENSEMBLE MODEL - 99.99% ACCURACY)")
+    print("VIRTUALHERD+ BACKEND - PRODUCTION (SQLITE + ENSEMBLE MODEL)")
     print("="*100)
-    print(f"\n✓ Services initialized")
+    print(f"\n✓ SQLite database: {DB_PATH}")
     print(f"✓ CSV data loaded: {len(data_loader.get_available_cows())} cattle available")
-    print(f"✓ ML Model: {'ENSEMBLE (99.99%)' if ensemble_model_loaded else 'FALLBACK (Rule-based)'}")
-    if ensemble_model_loaded:
-        print(f"  - Components: Random Forest + XGBoost + Gradient Boosting")
-        print(f"  - Features: 45 numeric")
-        print(f"  - Health Classes: FEVER, STRESS, HYPOTHERMIA, HEALTHY")
-    print(f"✓ Paddocks: 4 (North Field, South Field, East Pasture, West Pasture)")
-    print(f"✓ Schedule: Rotational grazing plan active")
-    print(f"✓ WebSocket real-time monitoring enabled")
-    print(f"✓ Server starting on http://localhost:5000")
-    print(f"\n📊 REST API Endpoints (15 total):")
-    print(f"  GET    /api/cattle              - Get all cattle")
-    print(f"  GET    /api/cattle/<id>         - Get cattle details")
-    print(f"  POST   /api/cattle              - Add cattle")
-    print(f"  DELETE /api/cattle/<id>         - Remove cattle")
-    print(f"  GET    /api/cattle/available    - Get available cattle")
-    print(f"  GET    /api/health              - Get herd health summary")
-    print(f"  GET    /api/alerts              - Get health alerts")
-    print(f"  GET    /api/paddocks            - Get all paddocks")
-    print(f"  GET    /api/paddocks/<id>       - Get paddock details")
-    print(f"  GET    /api/schedule            - Get rotation schedule")
-    print(f"  GET    /api/schedule/recommend  - Get next paddock recommendation")
-    print(f"  GET    /api/status              - Get backend status")
-    print(f"  GET    /api/dataset             - Get dataset information")
-    print(f"  GET    /api/ml/info             - Get ML model details")
+    print(f"✓ ML Model: {'ENSEMBLE (99.99%)' if ensemble_model_loaded else 'FALLBACK'}")
+    print(f"✓ Cattle restored from DB")
+    print(f"✓ Server starting on http://0.0.0.0:5000")
+    print(f"\n📊 REST API Endpoints:")
+    print(f"  GET/POST   /api/cattle")
+    print(f"  DELETE     /api/cattle/<id>")
+    print(f"  GET        /api/cattle/available")
+    print(f"  GET        /api/health")
+    print(f"  GET        /api/alerts")
+    print(f"  GET/POST   /api/farmer/paddocks")
+    print(f"  POST       /api/farmer/paddocks/<id>/assign")
+    print(f"  DELETE     /api/farmer/paddocks/<id>")
+    print(f"  GET/POST   /api/farmer/schedules")
+    print(f"  DELETE     /api/farmer/schedules/<id>")
+    print(f"  GET        /api/status")
     print(f"\n" + "="*100 + "\n")
-
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)

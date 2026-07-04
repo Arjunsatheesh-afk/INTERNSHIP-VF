@@ -440,8 +440,9 @@
 
 </div>
 
-<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <script>
+  let farmerPaddocksData = [];
   const BACKEND_URL = 'http://localhost:5000';
   const canvas = document.getElementById('canvas');
   const ctx = canvas.getContext('2d');
@@ -483,7 +484,35 @@
     for (let i = 0; i < canvas.height; i += 50) {
       ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(canvas.width, i); ctx.stroke();
     }
-
+    
+    // Draw farmer paddock boundaries
+    if (farmerPaddocksData && farmerPaddocksData.length > 0) {
+      farmerPaddocksData.forEach(p => {
+        if (!p.points || p.points.length < 2) return;
+        ctx.strokeStyle = '#f7c948';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        p.points.forEach((pt, i) => {
+          const x = (pt.x / 100) * canvas.width;
+          const y = (pt.y / 100) * canvas.height;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.closePath();
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // Label
+        if (p.points.length > 0) {
+          const cx = p.points.reduce((s, pt) => s + pt.x, 0) / p.points.length;
+          const cy = p.points.reduce((s, pt) => s + pt.y, 0) / p.points.length;
+          ctx.fillStyle = '#f7c948';
+          ctx.font = 'bold 11px Arial';
+          ctx.textAlign = 'center';
+          ctx.fillText(p.name, (cx / 100) * canvas.width, (cy / 100) * canvas.height);
+        }
+      });
+    }
     // Cattle dots
     Object.values(cattle).forEach(c => {
       const x = (c.x / 100) * canvas.width;
@@ -599,34 +628,30 @@
 
   // ── Update Paddocks tab ──
   function updatePaddocksTab() {
-    if (!paddocksData.length) {
-      document.getElementById('paddockList').innerHTML = '<div style="color: var(--muted);">No paddocks</div>';
-      return;
-    }
-
-    document.getElementById('paddockList').innerHTML = paddocksData.map(p => {
-      const badgeClass = p.recommended ? 'badge-recommended' :
-        p.status === 'available' ? 'badge-available' :
-        p.status === 'occupied' ? 'badge-occupied' : 'badge-recovering';
-      const badgeLabel = p.recommended ? '⭐ Recommended' : p.status;
-      const qualityColor = p.grass_quality >= 80 ? '#3fb950' : p.grass_quality >= 65 ? '#f7c948' : '#f85149';
-
-      return `
-        <div class="paddock-item">
-          <div class="paddock-header">
-            <div class="paddock-name">${p.name}</div>
-            <div class="paddock-badge ${badgeClass}">${badgeLabel}</div>
+  const paddockList = document.getElementById('paddockList');
+  if (!paddocksData || !paddocksData.length) {
+    paddockList.innerHTML = '<div style="color:var(--muted)">No paddocks created yet. Use mobile app to draw fence.</div>';
+    return;
+  }
+  paddockList.innerHTML = paddocksData.map(p => {
+    const quality = p.grass_quality || 80;
+    const qualityColor = quality >= 80 ? 'var(--accent)' : quality >= 65 ? 'var(--accent2)' : 'var(--danger)';
+    const cattleCount = (p.cattle_ids || []).length;
+    return `
+      <div class="paddock-item">
+        <div class="paddock-header">
+          <div class="paddock-name">${p.name}</div>
+          <div class="paddock-badge ${p.status === 'occupied' ? 'badge-occupied' : 'badge-available'}">
+            ${(p.status || 'available').toUpperCase()}
           </div>
-          <div class="paddock-stat"><span>Area</span><span>${p.area_hectares} ha</span></div>
-          <div class="paddock-stat"><span>Grass Quality</span><span style="color:${qualityColor}">${p.grass_quality}%</span></div>
-          <div class="paddock-stat"><span>Grass Available</span><span>${p.grass_available_kg} kg</span></div>
-          <div class="paddock-stat"><span>Cattle / Capacity</span><span>${p.cattle_count} / ${p.capacity}</span></div>
-          <div class="paddock-stat"><span>Days Resting</span><span>${p.days_resting}</span></div>
-          <div class="quality-bar-wrap">
-            <div class="quality-bar" style="width:${p.grass_quality}%; background:${qualityColor}"></div>
-          </div>
-        </div>`;
-    }).join('');
+        </div>
+        <div class="paddock-stat"><span>Fence Points</span><span>${(p.points || []).length}</span></div>
+        <div class="paddock-stat"><span>Grass Quality</span><span style="color:${qualityColor}">${quality}%</span></div>
+        <div class="paddock-stat"><span>Cattle Assigned</span><span>${cattleCount}</span></div>
+        <div class="paddock-stat"><span>Created</span><span>${p.created ? new Date(p.created).toLocaleDateString() : '—'}</span></div>
+        <div class="quality-bar-wrap"><div class="quality-bar" style="width:${quality}%;background:${qualityColor}"></div></div>
+      </div>`;
+   }).join('');
   }
 
   // ── Update Schedule tab ──
@@ -671,9 +696,13 @@
 
   // ── Fetch paddocks ──
   function fetchPaddocks() {
-    fetch(`${BACKEND_URL}/api/paddocks`)
+    fetch(`${BACKEND_URL}/api/farmer/paddocks`)
       .then(r => r.json())
-      .then(data => { paddocksData = data.paddocks || []; updatePaddocksTab(); })
+      .then(data => {
+        farmerPaddocksData = data.paddocks || [];
+        paddocksData = data.paddocks || [];
+        updatePaddocksTab();
+      })
       .catch(e => console.warn('Paddocks fetch error:', e));
   }
 
