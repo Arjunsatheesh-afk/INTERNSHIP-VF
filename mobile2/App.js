@@ -22,18 +22,86 @@ function healthColor(status) {
   if (s === 'fever' || s === 'stress') return C.danger;
   if (s === 'hypothermia') return C.accent2;
   if (s === 'lame') return C.warn;
+  if (s === 'fence_breach') return C.danger;
   return C.accent;
 }
 
 // ════════════════════════════════════════════════════════
 // TAB 1 — MAP
 // ════════════════════════════════════════════════════════
-function MapTab({ cattle, connected, farmerPaddocks }) {
+function MapTab({ cattle, connected, farmerPaddocks, simRunning, onToggleSim }) {
   const mapW = width - 32;
   const mapH = 300;
 
+  const renderFence = (p) => {
+    const pts = p.points;
+    if (!pts || pts.length < 2) return null;
+
+    const toXY = (pt) => ({
+      x: (pt.x / 100) * mapW,
+      y: (pt.y / 100) * mapH,
+    });
+
+    const lines = [];
+    for (let i = 1; i < pts.length; i++) {
+      const a = toXY(pts[i - 1]);
+      const b = toXY(pts[i]);
+      const len = Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2);
+      const angle = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+      lines.push(
+        <View key={`${p.id}-line-${i}`} style={{
+          position: 'absolute',
+          left: a.x, top: a.y,
+          width: len, height: 2,
+          backgroundColor: C.accent2,
+          transform: [{ rotate: `${angle}deg` }],
+          transformOrigin: '0 0',
+        }} />
+      );
+    }
+
+    // close the polygon
+    if (pts.length > 2) {
+      const a = toXY(pts[pts.length - 1]);
+      const b = toXY(pts[0]);
+      const len = Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2);
+      const angle = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+      lines.push(
+        <View key={`${p.id}-close`} style={{
+          position: 'absolute',
+          left: a.x, top: a.y,
+          width: len, height: 2,
+          backgroundColor: C.accent2,
+          opacity: 0.6,
+          transform: [{ rotate: `${angle}deg` }],
+          transformOrigin: '0 0',
+        }} />
+      );
+    }
+
+    const firstPt = toXY(pts[0]);
+
+    return (
+      <React.Fragment key={p.id}>
+        {lines}
+        <Text style={[s.fenceLabel, { top: Math.max(0, firstPt.y - 16), left: firstPt.x }]}>
+          {p.name}
+        </Text>
+      </React.Fragment>
+    );
+  };
+
   return (
     <ScrollView style={s.tab}>
+      <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+        <TouchableOpacity
+          style={[s.actionBtn, { backgroundColor: simRunning ? C.danger : C.accent, flex: 1 }]}
+          onPress={onToggleSim}
+        >
+          <Text style={s.actionBtnText}>{simRunning ? '⏹ Stop Simulation' : '▶ Start Simulation'}</Text>
+        </TouchableOpacity>
+      </View>
+
       <View style={s.statusRow}>
         <View style={[s.dot, { backgroundColor: connected ? C.accent : C.danger }]} />
         <Text style={s.statusText}>{connected ? 'LIVE' : 'DISCONNECTED'}</Text>
@@ -49,14 +117,7 @@ function MapTab({ cattle, connected, farmerPaddocks }) {
           <View key={`v${p}`} style={[s.gridLineV, { left: mapW * p }]} />
         ))}
 
-        {/* Draw farmer paddock boundaries */}
-        {farmerPaddocks.map(p => p.points.map((pt, i) => {
-          const x = (pt.x / 100) * mapW;
-          const y = (pt.y / 100) * mapH;
-          return (
-            <View key={`${p.id}-${i}`} style={[s.fencePoint, { left: x - 4, top: y - 4 }]} />
-          );
-        }))}
+        {farmerPaddocks.map(p => renderFence(p))}
 
         {Object.values(cattle).map(c => {
           const cx = (c.x / 100) * mapW;
@@ -82,7 +143,7 @@ function MapTab({ cattle, connected, farmerPaddocks }) {
           { color: C.accent, label: 'Healthy' },
           { color: C.pulse, label: 'Lying Down' },
           { color: C.warn, label: 'Lameness' },
-          { color: C.danger, label: 'Fever / Stress' },
+          { color: C.danger, label: 'Fever / Stress / Fence Breach' },
           { color: C.accent2, label: 'Hypothermia' },
         ].map(item => (
           <View key={item.label} style={s.legendRow}>
@@ -238,7 +299,6 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
 
   return (
     <ScrollView style={s.tab}>
-      {/* Grid drawing area */}
       <View style={s.card}>
         <Text style={s.cardTitle}>DRAW FENCE BOUNDARY</Text>
         <Text style={[s.muted, { marginBottom: 8, fontSize: 12 }]}>
@@ -250,7 +310,6 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
           onPress={handleGridTap}
           style={[s.drawGrid, { width: gridW - 28, height: gridH }]}
         >
-          {/* Grid lines */}
           {[0.2, 0.4, 0.6, 0.8].map(p => (
             <View key={`gh${p}`} style={[s.gridLineH, { top: gridH * p, backgroundColor: 'rgba(63,185,80,0.15)' }]} />
           ))}
@@ -258,7 +317,6 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
             <View key={`gv${p}`} style={[s.gridLineV, { left: (gridW - 28) * p, backgroundColor: 'rgba(63,185,80,0.15)' }]} />
           ))}
 
-          {/* Fence lines between points */}
           {points.length > 1 && points.map((pt, i) => {
             if (i === 0) return null;
             const prev = points[i - 1];
@@ -280,7 +338,6 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
             );
           })}
 
-          {/* Close fence line */}
           {points.length > 2 && (() => {
             const first = points[0];
             const last = points[points.length - 1];
@@ -303,7 +360,6 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
             );
           })()}
 
-          {/* Points */}
           {points.map((pt, i) => {
             const x = (pt.x / 100) * (gridW - 28);
             const y = (pt.y / 100) * gridH;
@@ -319,7 +375,6 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
           )}
         </TouchableOpacity>
 
-        {/* Paddock name input */}
         <TextInput
           style={[s.input, { marginTop: 10 }]}
           placeholder="Paddock name (e.g. Pasture 1)"
@@ -348,7 +403,6 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
         </View>
       </View>
 
-      {/* Saved paddocks */}
       <View style={s.card}>
         <Text style={s.cardTitle}>SAVED PADDOCKS ({farmerPaddocks.length})</Text>
         {farmerPaddocks.length === 0 ? (
@@ -379,7 +433,6 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
         )}
       </View>
 
-      {/* Assign cattle modal */}
       <Modal visible={showAssign} transparent animationType="slide">
         <View style={s.modalOverlay}>
           <View style={s.modalBox}>
@@ -434,7 +487,7 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
 }
 
 // ════════════════════════════════════════════════════════
-// TAB 4 — PADDOCKS (farmer-created only)
+// TAB 4 — PADDOCKS
 // ════════════════════════════════════════════════════════
 function PaddocksTab({ farmerPaddocks, cattle, onRefresh }) {
   return (
@@ -564,6 +617,7 @@ export default function App() {
   const [farmerPaddocks, setFarmerPaddocks] = useState([]);
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [simRunning, setSimRunning] = useState(false);
   const socketRef = useRef(null);
 
   const TABS = [
@@ -606,6 +660,8 @@ export default function App() {
     socket.on('paddock_created', () => fetchFarmerPaddocks());
     socket.on('paddock_updated', () => fetchFarmerPaddocks());
     socket.on('paddock_deleted', () => fetchFarmerPaddocks());
+
+    socket.on('simulation_status', (data) => setSimRunning(data.running));
 
     return () => socket.disconnect();
   }, []);
@@ -661,6 +717,14 @@ export default function App() {
     ]);
   };
 
+  const toggleSim = () => {
+    if (simRunning) {
+      socketRef.current.emit('stop_simulation');
+    } else {
+      socketRef.current.emit('start_simulation');
+    }
+  };
+
   return (
     <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
@@ -685,7 +749,15 @@ export default function App() {
         ))}
       </ScrollView>
 
-      {activeTab === 'map' && <MapTab cattle={cattle} connected={connected} farmerPaddocks={farmerPaddocks} />}
+      {activeTab === 'map' && (
+        <MapTab
+          cattle={cattle}
+          connected={connected}
+          farmerPaddocks={farmerPaddocks}
+          simRunning={simRunning}
+          onToggleSim={toggleSim}
+        />
+      )}
       {activeTab === 'cattle' && <CattleTab cattle={cattle} available={available} onAdd={handleAdd} onRemove={handleRemove} loading={loading} />}
       {activeTab === 'fence' && <DrawFenceTab cattle={cattle} farmerPaddocks={farmerPaddocks} onPaddockCreated={fetchFarmerPaddocks} />}
       {activeTab === 'paddocks' && <PaddocksTab farmerPaddocks={farmerPaddocks} cattle={cattle} onRefresh={fetchFarmerPaddocks} />}
@@ -723,6 +795,7 @@ const s = StyleSheet.create({
   dot: { width: 8, height: 8, borderRadius: 4 },
   mapBox: { backgroundColor: '#0a1520', borderRadius: 10, marginBottom: 12, borderWidth: 1, borderColor: C.border, overflow: 'hidden', position: 'relative' },
   mapLabel: { color: C.muted, fontSize: 10, fontWeight: '700', letterSpacing: 1, position: 'absolute', top: 8, left: 10 },
+  fenceLabel: { color: C.accent2, fontSize: 10, fontWeight: '700', position: 'absolute' },
   mapEmpty: { color: C.muted, textAlign: 'center', marginTop: 120, fontSize: 13 },
   gridLineH: { position: 'absolute', left: 0, right: 0, height: 1, backgroundColor: 'rgba(47,85,59,0.2)' },
   gridLineV: { position: 'absolute', top: 0, bottom: 0, width: 1, backgroundColor: 'rgba(47,85,59,0.2)' },

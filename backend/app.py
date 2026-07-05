@@ -1,6 +1,5 @@
 """
-VIRTUALHERD+ BACKEND - PRODUCTION VERSION WITH SQLITE PERSISTENCE
-Flask Application with Ensemble ML Model (99.99% Accuracy)
+VIRTUALHERD+ BACKEND - PRODUCTION VERSION WITH SQLITE + FENCE BREACH DETECTION
 """
 
 from flask import Flask, jsonify, request
@@ -10,6 +9,8 @@ import threading
 import time
 import sqlite3
 import json
+import math
+import random
 from datetime import datetime
 from services.cattle_service import get_cattle_service
 from services.data_loader import get_data_loader
@@ -31,7 +32,6 @@ try:
     health_label_encoder = joblib.load(ml_models_dir / 'label_encoder.pkl')
     feature_list = joblib.load(ml_models_dir / 'feature_list.pkl')
     print("[ML] ✓ Loaded Ensemble Model (99.99% Accuracy)")
-    print(f"[ML] ✓ Health Classes: {list(health_label_encoder.classes_)}")
     ensemble_model_loaded = True
 except Exception as e:
     print(f"[ML] ⚠ Fallback: {e}")
@@ -41,6 +41,7 @@ except Exception as e:
     feature_list = None
 
 simulation_running = False
+simulation_thread = None
 training_day = 1
 alerts = []
 
@@ -58,45 +59,21 @@ def get_db():
 def init_db():
     conn = get_db()
     c = conn.cursor()
-    
-    # Farmer paddocks table
     c.execute('''CREATE TABLE IF NOT EXISTS farmer_paddocks (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        points TEXT DEFAULT '[]',
-        cattle_ids TEXT DEFAULT '[]',
-        status TEXT DEFAULT 'available',
-        grass_quality INTEGER DEFAULT 80,
-        created TEXT
-    )''')
-    
-    # Persisted cattle table
+        id TEXT PRIMARY KEY, name TEXT, points TEXT DEFAULT '[]',
+        cattle_ids TEXT DEFAULT '[]', status TEXT DEFAULT 'available',
+        grass_quality INTEGER DEFAULT 80, created TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS active_cattle (
-        cattle_id INTEGER PRIMARY KEY,
-        added_at TEXT
-    )''')
-
-    # Schedules table
+        cattle_id INTEGER PRIMARY KEY, added_at TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS schedules (
-        id TEXT PRIMARY KEY,
-        paddock_id TEXT,
-        paddock_name TEXT,
-        cattle_ids TEXT DEFAULT '[]',
-        start_time TEXT,
-        end_time TEXT,
-        notes TEXT,
-        created TEXT
-    )''')
-
+        id TEXT PRIMARY KEY, paddock_id TEXT, paddock_name TEXT,
+        cattle_ids TEXT DEFAULT '[]', start_time TEXT,
+        end_time TEXT, notes TEXT, created TEXT)''')
     conn.commit()
     conn.close()
     print("[DB] ✓ SQLite database initialized")
 
 init_db()
-
-# ============================================================================
-# RESTORE CATTLE FROM DB ON STARTUP
-# ============================================================================
 
 def restore_cattle():
     conn = get_db()
@@ -107,6 +84,78 @@ def restore_cattle():
     print(f"[DB] ✓ Restored {len(rows)} cattle from database")
 
 restore_cattle()
+
+# ============================================================================
+# POINT-IN-POLYGON (Ray casting algorithm)
+# ============================================================================
+
+def point_in_polygon(x, y, polygon):
+    """Returns True if point (x,y) is inside polygon (list of {x,y} dicts)"""
+    if not polygon or len(polygon) < 3:
+        return True  # No fence = anywhere is valid
+    n = len(polygon)
+    inside = False
+    px, py = x, y
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]['x'], polygon[i]['y']
+        xj, yj = polygon[j]['x'], polygon[j]['y']
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+def get_polygon_center(polygon):
+    """Get centroid of polygon"""
+    if not polygon:
+        return 50, 50
+    cx = sum(p['x'] for p in polygon) / len(polygon)
+    cy = sum(p['y'] for p in polygon) / len(polygon)
+    return cx, cy
+
+def random_point_in_polygon(polygon, max_tries=100):
+    """Get a random point inside a polygon"""
+    if not polygon or len(polygon) < 3:
+        return random.uniform(20, 80), random.uniform(20, 80)
+    
+    xs = [p['x'] for p in polygon]
+    ys = [p['y'] for p in polygon]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    
+    for _ in range(max_tries):
+        rx = random.uniform(min_x, max_x)
+        ry = random.uniform(min_y, max_y)
+        if point_in_polygon(rx, ry, polygon):
+            return rx, ry
+    
+    # Fallback to centroid
+    return get_polygon_center(polygon)
+
+def get_active_paddock():
+    """Get the first occupied paddock with fence points"""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM farmer_paddocks WHERE status='occupied' OR cattle_ids != '[]'"
+    ).fetchall()
+    conn.close()
+    for row in rows:
+        p = dict(row)
+        p['points'] = json.loads(p['points'] or '[]')
+        p['cattle_ids'] = json.loads(p['cattle_ids'] or '[]')
+        if len(p['points']) >= 3:
+            return p
+    # If no occupied, return any paddock with points
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM farmer_paddocks").fetchall()
+    conn.close()
+    for row in rows:
+        p = dict(row)
+        p['points'] = json.loads(p['points'] or '[]')
+        p['cattle_ids'] = json.loads(p['cattle_ids'] or '[]')
+        if len(p['points']) >= 3:
+            return p
+    return None
 
 # ============================================================================
 # ML PREDICTION
@@ -191,18 +240,34 @@ def add_cattle():
     cattle_id = data.get('cattle_id')
     if not cattle_id:
         return jsonify({'error': 'cattle_id required'}), 400
+    
     cattle = cattle_service.add_cattle(cattle_id)
     if cattle:
+        # Spawn inside active paddock if one exists
+        paddock = get_active_paddock()
+        if paddock and paddock['points']:
+            rx, ry = random_point_in_polygon(paddock['points'])
+            cattle.x = rx
+            cattle.y = ry
+            print(f"[SPAWN] Cattle {cattle_id} spawned inside {paddock['name']} at ({rx:.1f}, {ry:.1f})")
+        
         health_status, confidence = predict_health_status(cattle)
         cattle.health_status = health_status
+        
         # Persist to DB
         conn = get_db()
         conn.execute('INSERT OR IGNORE INTO active_cattle (cattle_id, added_at) VALUES (?, ?)',
                      (cattle_id, datetime.now().isoformat()))
         conn.commit()
         conn.close()
+        
         socketio.emit('cattle_added', {'cattle': cattle.to_dict()}, to=None)
-        return jsonify({'status': 'success', 'message': f'Cattle {cattle_id} added', 'cattle': cattle.to_dict()}), 201
+        return jsonify({
+            'status': 'success',
+            'message': f'Cattle {cattle_id} added',
+            'spawned_in_paddock': paddock['name'] if paddock else None,
+            'cattle': cattle.to_dict()
+        }), 201
     else:
         return jsonify({'error': f'Failed to add cattle {cattle_id}'}), 400
 
@@ -210,7 +275,6 @@ def add_cattle():
 def remove_cattle(cattle_id):
     success = cattle_service.remove_cattle(cattle_id)
     if success:
-        # Remove from DB
         conn = get_db()
         conn.execute('DELETE FROM active_cattle WHERE cattle_id = ?', (cattle_id,))
         conn.commit()
@@ -241,7 +305,6 @@ def get_health_status():
         'alerts': len(alerts),
         'alert_summary': alerts[-10:] if alerts else [],
         'model_accuracy': '99.99%' if ensemble_model_loaded else '~98%',
-        'model_type': 'Ensemble (RF+XGB+GB)' if ensemble_model_loaded else 'Rule-based'
     })
 
 @app.route('/api/alerts', methods=['GET'])
@@ -250,7 +313,7 @@ def get_alerts_route():
     return jsonify({'alerts': current_alerts, 'count': len(current_alerts)})
 
 # ============================================================================
-# FARMER PADDOCKS (SQLITE PERSISTED)
+# FARMER PADDOCKS
 # ============================================================================
 
 @app.route('/api/farmer/paddocks', methods=['GET'])
@@ -316,7 +379,7 @@ def delete_farmer_paddock(paddock_id):
     return jsonify({'status': 'success'})
 
 # ============================================================================
-# SCHEDULES (SQLITE PERSISTED)
+# SCHEDULES
 # ============================================================================
 
 @app.route('/api/farmer/schedules', methods=['GET'])
@@ -362,14 +425,13 @@ def delete_schedule(schedule_id):
     return jsonify({'status': 'success'})
 
 # ============================================================================
-# STATUS ENDPOINTS
+# STATUS
 # ============================================================================
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
     conn = get_db()
     paddock_count = conn.execute('SELECT COUNT(*) as cnt FROM farmer_paddocks').fetchone()['cnt']
-    cattle_count = conn.execute('SELECT COUNT(*) as cnt FROM active_cattle').fetchone()['cnt']
     conn.close()
     return jsonify({
         'status': 'running',
@@ -380,7 +442,7 @@ def get_status():
         'training_day': training_day,
         'paddocks': paddock_count,
         'ml_model': {
-            'type': 'Ensemble (Random Forest + XGBoost + Gradient Boosting)',
+            'type': 'Ensemble (RF + XGB + GB)',
             'status': 'loaded' if ensemble_model_loaded else 'fallback',
             'accuracy': '99.99%',
             'features': 45,
@@ -396,7 +458,6 @@ def get_ml_info():
         'model_name': 'Ensemble Voting Classifier',
         'ensemble_accuracy': '99.99%',
         'features_used': 45,
-        'health_classes': ['FEVER', 'STRESS', 'HYPOTHERMIA', 'HEALTHY'],
         'status': 'production-ready'
     })
 
@@ -415,8 +476,10 @@ def handle_connect():
     socketio.emit('response', {
         'status': 'connected',
         'cattle_count': cattle_service.get_cattle_count(),
+        'simulation_running': simulation_running,
         'timestamp': datetime.now().isoformat()
     })
+    socketio.emit('simulation_status', {'running': simulation_running})
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -424,37 +487,144 @@ def handle_disconnect():
 
 @socketio.on('start_simulation')
 def handle_start():
-    global simulation_running
+    global simulation_running, simulation_thread
+    if simulation_running:
+        socketio.emit('response', {'status': 'Already running'})
+        return
     simulation_running = True
-    socketio.emit('response', {'status': 'Simulation started'}, to=None)
-    start_simulation_loop()
+    print("[WS] Simulation started")
+    socketio.emit('simulation_status', {'running': True}, to=None)
+    simulation_thread = threading.Thread(target=simulation_loop, daemon=True)
+    simulation_thread.start()
 
 @socketio.on('stop_simulation')
 def handle_stop():
     global simulation_running
     simulation_running = False
-    socketio.emit('response', {'status': 'Simulation stopped'}, to=None)
+    print("[WS] Simulation stopped")
+    socketio.emit('simulation_status', {'running': False}, to=None)
 
-def start_simulation_loop():
-    def loop():
-        step = 0
-        while simulation_running:
-            step += 1
-            cattle_service.update_all_cattle()
-            for cattle in cattle_service.get_all_cattle():
+# ============================================================================
+# SIMULATION LOOP WITH FENCE BREACH DETECTION
+# ============================================================================
+
+def simulation_loop():
+    global alerts
+    step = 0
+    print("[SIM] Simulation loop started")
+
+    while simulation_running:
+        step += 1
+
+        # Get active paddock and its polygon
+        paddock = get_active_paddock()
+        polygon = paddock['points'] if paddock else []
+
+        breach_alerts = []
+
+        for cattle in cattle_service.get_all_cattle():
+            # Update heading
+            cattle.heading += random.uniform(-20, 20)
+            cattle.heading %= 360
+
+            has_fence = bool(polygon) and len(polygon) >= 3
+            already_outside = has_fence and not point_in_polygon(cattle.x, cattle.y, polygon)
+
+            if already_outside:
+                # Cow is already outside the fence — actively steer it back toward center
+                cx, cy = get_polygon_center(polygon)
+                angle_to_center = math.atan2(cy - cattle.y, cx - cattle.x)
+                cattle.heading = math.degrees(angle_to_center) + random.uniform(-10, 10)
+                rad = math.radians(cattle.heading)
+                new_x = max(0, min(100, cattle.x + cattle.speed * math.cos(rad) * 0.3))
+                new_y = max(0, min(100, cattle.y + cattle.speed * math.sin(rad) * 0.3))
+
+                # Apply the move — cattle outside the fence are allowed to walk (toward center)
+                cattle.x = new_x
+                cattle.y = new_y
+
+                if point_in_polygon(new_x, new_y, polygon):
+                    # Made it back inside this tick
+                    cattle.health_status = 'HEALTHY'
+                else:
+                    # Still outside — keep alerting
+                    alert = {
+                        'cattle_id': cattle.cattle_id,
+                        'type': 'FENCE_BREACH',
+                        'severity': 'critical',
+                        'message': f'Cattle #{cattle.cattle_id} outside fence boundary',
+                        'timestamp': datetime.now().isoformat(),
+                        'position': {'x': cattle.x, 'y': cattle.y}
+                    }
+                    breach_alerts.append(alert)
+                    alerts.append(alert)
+                    if len(alerts) > 100:
+                        alerts = alerts[-100:]
+                    cattle.health_status = 'FENCE_BREACH'
+            else:
+                rad = math.radians(cattle.heading)
+                new_x = max(0, min(100, cattle.x + cattle.speed * math.cos(rad) * 0.3))
+                new_y = max(0, min(100, cattle.y + cattle.speed * math.sin(rad) * 0.3))
+
+                if has_fence and not point_in_polygon(new_x, new_y, polygon):
+                    # About to exit the fence — steer back, don't apply this move
+                    cx, cy = get_polygon_center(polygon)
+                    angle_to_center = math.atan2(cy - cattle.y, cx - cattle.x)
+                    cattle.heading = math.degrees(angle_to_center) + random.uniform(-15, 15)
+
+                    alert = {
+                        'cattle_id': cattle.cattle_id,
+                        'type': 'FENCE_BREACH',
+                        'severity': 'critical',
+                        'message': f'Cattle #{cattle.cattle_id} breached fence boundary',
+                        'timestamp': datetime.now().isoformat(),
+                        'position': {'x': cattle.x, 'y': cattle.y}
+                    }
+                    breach_alerts.append(alert)
+                    alerts.append(alert)
+                    if len(alerts) > 100:
+                        alerts = alerts[-100:]
+                    cattle.health_status = 'FENCE_BREACH'
+                else:
+                    cattle.x = new_x
+                    cattle.y = new_y
+                    if cattle.health_status == 'FENCE_BREACH':
+                        cattle.health_status = 'HEALTHY'
+
+            # Update health metrics
+            cattle.temperature = max(37.0, min(41.0, cattle.temperature + random.uniform(-0.2, 0.2)))
+            cattle.heart_rate = max(60, min(120, cattle.heart_rate + random.randint(-3, 3)))
+            cattle.milk_production = max(15, min(35, cattle.milk_production + random.uniform(-0.2, 0.2)))
+
+            # ML health prediction (only if not currently flagged as breaching)
+            if cattle.health_status != 'FENCE_BREACH':
                 health_status, confidence = predict_health_status(cattle)
                 cattle.health_status = health_status
-            cattle_data = cattle_service.get_cattle_list_for_api()
-            current_alerts = cattle_service.get_alerts()
-            socketio.emit('cattle_update', {
-                'cattle': cattle_data,
-                'alerts': current_alerts,
-                'step': step,
+
+        # Broadcast updates
+        cattle_data = cattle_service.get_cattle_list_for_api()
+        current_alerts = cattle_service.get_alerts()
+        all_alerts = current_alerts + breach_alerts
+
+        socketio.emit('cattle_update', {
+            'cattle': cattle_data,
+            'alerts': all_alerts,
+            'breach_alerts': breach_alerts,
+            'step': step,
+            'simulation_running': True,
+            'timestamp': datetime.now().isoformat()
+        }, to=None)
+
+        # Broadcast breach alerts separately for immediate UI response
+        if breach_alerts:
+            socketio.emit('fence_breach', {
+                'alerts': breach_alerts,
                 'timestamp': datetime.now().isoformat()
             }, to=None)
-            time.sleep(1)
-    thread = threading.Thread(target=loop, daemon=True)
-    thread.start()
+
+        time.sleep(1)
+
+    print("[SIM] Simulation loop stopped")
 
 # ============================================================================
 # ERROR HANDLERS
@@ -474,24 +644,26 @@ def server_error(error):
 
 if __name__ == '__main__':
     print("\n" + "="*100)
-    print("VIRTUALHERD+ BACKEND - PRODUCTION (SQLITE + ENSEMBLE MODEL)")
+    print("VIRTUALHERD+ BACKEND - SQLITE + ENSEMBLE + FENCE BREACH DETECTION")
     print("="*100)
-    print(f"\n✓ SQLite database: {DB_PATH}")
-    print(f"✓ CSV data loaded: {len(data_loader.get_available_cows())} cattle available")
+    print(f"\n✓ SQLite: {DB_PATH}")
+    print(f"✓ CSV data: {len(data_loader.get_available_cows())} cattle available")
     print(f"✓ ML Model: {'ENSEMBLE (99.99%)' if ensemble_model_loaded else 'FALLBACK'}")
-    print(f"✓ Cattle restored from DB")
-    print(f"✓ Server starting on http://0.0.0.0:5000")
-    print(f"\n📊 REST API Endpoints:")
+    print(f"✓ Fence breach detection: ENABLED")
+    print(f"✓ Point-in-polygon: ENABLED")
+    print(f"✓ Server: http://0.0.0.0:5000")
+    print(f"\n📊 Endpoints:")
     print(f"  GET/POST   /api/cattle")
     print(f"  DELETE     /api/cattle/<id>")
     print(f"  GET        /api/cattle/available")
-    print(f"  GET        /api/health")
-    print(f"  GET        /api/alerts")
     print(f"  GET/POST   /api/farmer/paddocks")
     print(f"  POST       /api/farmer/paddocks/<id>/assign")
     print(f"  DELETE     /api/farmer/paddocks/<id>")
     print(f"  GET/POST   /api/farmer/schedules")
-    print(f"  DELETE     /api/farmer/schedules/<id>")
     print(f"  GET        /api/status")
+    print(f"\n🔗 WebSocket events:")
+    print(f"  start_simulation  → starts movement + breach detection")
+    print(f"  stop_simulation   → stops loop")
+    print(f"  fence_breach      → emitted when cattle exits boundary")
     print(f"\n" + "="*100 + "\n")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
