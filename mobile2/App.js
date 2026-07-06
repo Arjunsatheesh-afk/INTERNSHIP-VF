@@ -6,6 +6,7 @@ import {
 } from 'react-native';
 import axios from 'axios';
 import { io } from 'socket.io-client';
+import DateTimePicker from '@react-native-community/datetimepicker';
 
 const BACKEND = 'http://192.168.1.8:5000';
 const { width, height } = Dimensions.get('window');
@@ -60,7 +61,6 @@ function MapTab({ cattle, connected, farmerPaddocks, simRunning, onToggleSim }) 
       );
     }
 
-    // close the polygon
     if (pts.length > 2) {
       const a = toXY(pts[pts.length - 1]);
       const b = toXY(pts[0]);
@@ -215,6 +215,7 @@ function CattleTab({ cattle, available, onAdd, onRemove, loading }) {
 function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
   const [points, setPoints] = useState([]);
   const [paddockName, setPaddockName] = useState('');
+  const [scheduleTime, setScheduleTime] = useState('');
   const [saving, setSaving] = useState(false);
   const [showAssign, setShowAssign] = useState(false);
   const [selectedPaddock, setSelectedPaddock] = useState(null);
@@ -228,6 +229,12 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
     const x = Math.round((locationX / gridW) * 100);
     const y = Math.round((locationY / gridH) * 100);
     setPoints([...points, { x, y }]);
+  };
+
+  const quickTime = (minutesFromNow) => {
+    const d = new Date(Date.now() + minutesFromNow * 60000);
+    const pad = (n) => String(n).padStart(2, '0');
+    setScheduleTime(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`);
   };
 
   const savePaddock = async () => {
@@ -245,9 +252,27 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
         name: paddockName.trim(),
         points: points,
       });
-      Alert.alert('✅ Saved', `${paddockName} created successfully`);
+
+      const newPaddock = res.data.paddock;
+
+      // If a schedule time was given, create the schedule immediately too
+      if (scheduleTime.trim()) {
+        const iso = scheduleTime.trim().replace(' ', 'T');
+        await axios.post(`${BACKEND}/api/farmer/schedules`, {
+          paddock_id: newPaddock.id,
+          paddock_name: newPaddock.name,
+          cattle_ids: [],
+          start_time: iso,
+          notes: '',
+        });
+        Alert.alert('✅ Saved & Scheduled', `${paddockName} created — herd moves here at ${scheduleTime}`);
+      } else {
+        Alert.alert('✅ Saved', `${paddockName} created successfully`);
+      }
+
       setPoints([]);
       setPaddockName('');
+      setScheduleTime('');
       onPaddockCreated();
     } catch (e) {
       Alert.alert('Error', 'Failed to save paddock');
@@ -383,7 +408,32 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
           onChangeText={setPaddockName}
         />
 
-        <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
+        <Text style={[s.muted, { marginBottom: 6, marginTop: 4 }]}>
+          ACTIVATE AT (optional — leave blank to activate immediately)
+        </Text>
+        <TextInput
+          style={s.input}
+          placeholder="2026-07-06 14:30"
+          placeholderTextColor={C.muted}
+          value={scheduleTime}
+          onChangeText={setScheduleTime}
+        />
+        <View style={{ flexDirection: 'row', gap: 8, marginBottom: 10 }}>
+          <TouchableOpacity style={s.smallBtn2} onPress={() => quickTime(0.25)}>
+            <Text style={s.smallBtn2Text}>+15 sec</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.smallBtn2} onPress={() => quickTime(1)}>
+            <Text style={s.smallBtn2Text}>+1 min</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.smallBtn2} onPress={() => quickTime(60)}>
+            <Text style={s.smallBtn2Text}>+1 hour</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.smallBtn2} onPress={() => quickTime(1440)}>
+            <Text style={s.smallBtn2Text}>+1 day</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={{ flexDirection: 'row', gap: 8 }}>
           <TouchableOpacity
             style={[s.actionBtn, { backgroundColor: C.danger, flex: 1 }]}
             onPress={() => setPoints([])}
@@ -558,7 +608,48 @@ function PaddocksTab({ farmerPaddocks, cattle, onRefresh }) {
 }
 
 // ════════════════════════════════════════════════════════
-// TAB 5 — HEALTH
+// TAB — SCHEDULE
+// ════════════════════════════════════════════════════════
+function ScheduleTab({ schedules, farmerPaddocks, onRefresh }) {
+  const getPaddockStatus = (paddockId) => {
+    const p = farmerPaddocks.find(fp => fp.id === paddockId);
+    return p?.status === 'occupied' ? 'ACTIVE NOW' : 'inactive';
+  };
+
+  return (
+    <ScrollView style={s.tab}>
+      <TouchableOpacity style={s.refreshBtn} onPress={onRefresh}>
+        <Text style={s.refreshBtnText}>↻ Refresh</Text>
+      </TouchableOpacity>
+
+      <View style={s.card}>
+        <Text style={s.cardTitle}>PASTURE SCHEDULE ({schedules.length})</Text>
+        {schedules.length === 0 ? (
+          <Text style={s.muted}>No pasture schedules yet. Set a time while saving a paddock in Draw Fence tab.</Text>
+        ) : (
+          schedules.map(sc => {
+            const status = getPaddockStatus(sc.paddock_id);
+            const isActive = status === 'ACTIVE NOW';
+            return (
+              <View key={sc.id} style={[s.savedPaddock, isActive && { borderColor: C.accent }]}>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.savedPaddockName}>{sc.paddock_name}</Text>
+                  <Text style={s.muted}>{sc.start_time?.replace('T', ' ')}</Text>
+                </View>
+                <View style={[s.badge, isActive ? s.badgeOccupied : s.badgeAvailable]}>
+                  <Text style={s.badgeText}>{isActive ? 'ACTIVE' : (sc.activated ? 'DONE' : 'PENDING')}</Text>
+                </View>
+              </View>
+            );
+          })
+        )}
+      </View>
+    </ScrollView>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// TAB — HEALTH
 // ════════════════════════════════════════════════════════
 function HealthTab({ cattle }) {
   const cattleArr = Object.values(cattle);
@@ -615,6 +706,7 @@ export default function App() {
   const [cattle, setCattle] = useState({});
   const [available, setAvailable] = useState([]);
   const [farmerPaddocks, setFarmerPaddocks] = useState([]);
+  const [schedules, setSchedules] = useState([]);
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(false);
   const [simRunning, setSimRunning] = useState(false);
@@ -625,6 +717,7 @@ export default function App() {
     { id: 'cattle', label: '🐄 Cattle' },
     { id: 'fence', label: '📍 Draw Fence' },
     { id: 'paddocks', label: '🌾 Paddocks' },
+    { id: 'schedule', label: '📅 Schedule' },
     { id: 'health', label: '❤️ Health' },
   ];
 
@@ -661,13 +754,21 @@ export default function App() {
     socket.on('paddock_updated', () => fetchFarmerPaddocks());
     socket.on('paddock_deleted', () => fetchFarmerPaddocks());
 
+    socket.on('schedule_created', () => fetchSchedules());
+    socket.on('schedule_deleted', () => fetchSchedules());
+    socket.on('schedule_activated', (data) => {
+      fetchSchedules();
+      fetchFarmerPaddocks();
+      Alert.alert('🐄 Herd Moved', `Herd is now moving to ${data.paddock_name}`);
+    });
+
     socket.on('simulation_status', (data) => setSimRunning(data.running));
 
     return () => socket.disconnect();
   }, []);
 
   const fetchAll = () => {
-    fetchCattle(); fetchAvailable(); fetchFarmerPaddocks();
+    fetchCattle(); fetchAvailable(); fetchFarmerPaddocks(); fetchSchedules();
   };
 
   const fetchCattle = async () => {
@@ -691,6 +792,13 @@ export default function App() {
       const r = await axios.get(`${BACKEND}/api/farmer/paddocks`);
       setFarmerPaddocks(r.data.paddocks || []);
     } catch (e) { console.warn('fetchFarmerPaddocks', e.message); }
+  };
+
+  const fetchSchedules = async () => {
+    try {
+      const r = await axios.get(`${BACKEND}/api/farmer/schedules`);
+      setSchedules(r.data.schedules || []);
+    } catch (e) { console.warn('fetchSchedules', e.message); }
   };
 
   const handleAdd = async (id) => {
@@ -761,6 +869,14 @@ export default function App() {
       {activeTab === 'cattle' && <CattleTab cattle={cattle} available={available} onAdd={handleAdd} onRemove={handleRemove} loading={loading} />}
       {activeTab === 'fence' && <DrawFenceTab cattle={cattle} farmerPaddocks={farmerPaddocks} onPaddockCreated={fetchFarmerPaddocks} />}
       {activeTab === 'paddocks' && <PaddocksTab farmerPaddocks={farmerPaddocks} cattle={cattle} onRefresh={fetchFarmerPaddocks} />}
+      {activeTab === 'schedule' && (
+        <ScheduleTab
+          farmerPaddocks={farmerPaddocks}
+          cattle={cattle}
+          schedules={schedules}
+          onRefresh={fetchSchedules}
+        />
+      )}
       {activeTab === 'health' && <HealthTab cattle={cattle} />}
     </SafeAreaView>
   );
@@ -850,4 +966,10 @@ const s = StyleSheet.create({
   assignRowSelected: { backgroundColor: 'rgba(63,185,80,0.1)', borderRadius: 6, paddingHorizontal: 6 },
   assignId: { color: C.text, fontWeight: '600', flex: 1 },
   assignStatus: { fontSize: 12 },
+  pillBtn: { borderWidth: 1, borderColor: C.border, borderRadius: 16, paddingHorizontal: 12, paddingVertical: 6, marginRight: 6, backgroundColor: C.surface },
+  pillBtnActive: { backgroundColor: C.accent, borderColor: C.accent },
+  pillBtnText: { color: C.muted, fontSize: 12, fontWeight: '600' },
+  pillBtnTextActive: { color: '#fff' },
+  smallBtn2: { flex: 1, backgroundColor: C.surface2, borderWidth: 1, borderColor: C.border, borderRadius: 6, padding: 8, alignItems: 'center' },
+  smallBtn2Text: { color: C.accent, fontSize: 12, fontWeight: '600' },
 });
