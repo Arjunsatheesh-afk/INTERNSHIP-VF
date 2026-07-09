@@ -6,7 +6,6 @@ import {
 } from 'react-native';
 import axios from 'axios';
 import { io } from 'socket.io-client';
-import DateTimePicker from '@react-native-community/datetimepicker';
 
 const BACKEND = 'http://192.168.1.8:5000';
 const { width, height } = Dimensions.get('window');
@@ -117,7 +116,7 @@ function MapTab({ cattle, connected, farmerPaddocks, simRunning, onToggleSim }) 
           <View key={`v${p}`} style={[s.gridLineV, { left: mapW * p }]} />
         ))}
 
-        {farmerPaddocks.map(p => renderFence(p))}
+        {farmerPaddocks.filter(p => p.status === 'occupied').map(p => renderFence(p))}
 
         {Object.values(cattle).map(c => {
           const cx = (c.x / 100) * mapW;
@@ -210,7 +209,7 @@ function CattleTab({ cattle, available, onAdd, onRemove, loading }) {
 }
 
 // ════════════════════════════════════════════════════════
-// TAB 3 — DRAW FENCE
+// TAB 3 — DRAW FENCE (includes optional scheduling at save time)
 // ════════════════════════════════════════════════════════
 function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
   const [points, setPoints] = useState([]);
@@ -255,7 +254,6 @@ function DrawFenceTab({ cattle, farmerPaddocks, onPaddockCreated }) {
 
       const newPaddock = res.data.paddock;
 
-      // If a schedule time was given, create the schedule immediately too
       if (scheduleTime.trim()) {
         const iso = scheduleTime.trim().replace(' ', 'T');
         await axios.post(`${BACKEND}/api/farmer/schedules`, {
@@ -608,7 +606,7 @@ function PaddocksTab({ farmerPaddocks, cattle, onRefresh }) {
 }
 
 // ════════════════════════════════════════════════════════
-// TAB — SCHEDULE
+// TAB — SCHEDULE (read-only summary)
 // ════════════════════════════════════════════════════════
 function ScheduleTab({ schedules, farmerPaddocks, onRefresh }) {
   const getPaddockStatus = (paddockId) => {
@@ -867,16 +865,17 @@ export default function App() {
         />
       )}
       {activeTab === 'cattle' && <CattleTab cattle={cattle} available={available} onAdd={handleAdd} onRemove={handleRemove} loading={loading} />}
-      {activeTab === 'fence' && <DrawFenceTab cattle={cattle} farmerPaddocks={farmerPaddocks} onPaddockCreated={fetchFarmerPaddocks} />}
+      {activeTab === 'fence' && <DrawFenceTab cattle={cattle} farmerPaddocks={farmerPaddocks} onPaddockCreated={() => { fetchFarmerPaddocks(); fetchSchedules(); }} />}
       {activeTab === 'paddocks' && <PaddocksTab farmerPaddocks={farmerPaddocks} cattle={cattle} onRefresh={fetchFarmerPaddocks} />}
+
       {activeTab === 'schedule' && (
         <ScheduleTab
-          farmerPaddocks={farmerPaddocks}
-          cattle={cattle}
           schedules={schedules}
-          onRefresh={fetchSchedules}
+          farmerPaddocks={farmerPaddocks}
+          onRefresh={() => { fetchSchedules(); fetchFarmerPaddocks(); }}
         />
       )}
+
       {activeTab === 'health' && <HealthTab cattle={cattle} />}
     </SafeAreaView>
   );

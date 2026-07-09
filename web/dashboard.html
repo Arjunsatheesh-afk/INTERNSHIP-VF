@@ -299,25 +299,14 @@
 
   .schedule-day.today { border-color: var(--accent); }
 
-  .schedule-day-num {
-    font-size: 1.8rem;
-    font-weight: 700;
-    color: var(--accent);
-    min-width: 40px;
-    text-align: center;
-    font-family: 'DM Mono', monospace;
-  }
-
-  .schedule-day.today .schedule-day-num { color: var(--accent2); }
-
   .schedule-day-info { flex: 1; }
-  .schedule-day-name { font-weight: 600; margin-bottom: 4px; }
+  .schedule-day-name { font-weight: 600; margin-bottom: 4px; color: var(--accent); }
   .schedule-day-paddock { color: var(--accent); font-size: 0.85rem; margin-bottom: 4px; }
   .schedule-day-details { color: var(--muted); font-size: 0.75rem; }
 
   .schedule-quality {
     text-align: right;
-    min-width: 60px;
+    min-width: 70px;
   }
   .schedule-quality-num { font-size: 1.2rem; font-weight: 700; color: var(--accent); }
   .schedule-quality-label { font-size: 0.65rem; color: var(--muted); }
@@ -484,10 +473,10 @@
     for (let i = 0; i < canvas.height; i += 50) {
       ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(canvas.width, i); ctx.stroke();
     }
-    
-    // Draw farmer paddock boundaries
+
+    // Draw farmer paddock boundaries — ONLY the currently active (occupied) paddock
     if (farmerPaddocksData && farmerPaddocksData.length > 0) {
-      farmerPaddocksData.forEach(p => {
+      farmerPaddocksData.filter(p => p.status === 'occupied').forEach(p => {
         if (!p.points || p.points.length < 2) return;
         ctx.strokeStyle = '#f7c948';
         ctx.lineWidth = 2;
@@ -657,33 +646,34 @@
   // ── Update Schedule tab ──
   function updateScheduleTab() {
     if (!scheduleData.length) {
-      document.getElementById('scheduleView').innerHTML = '<div style="color: var(--muted);">No schedule</div>';
+      document.getElementById('scheduleView').innerHTML =
+        '<div style="color: var(--muted);">No pasture schedules yet.</div>';
       return;
     }
 
-    const recommendation = scheduleData.recommended_next || 'P3';
-    const days = Array.isArray(scheduleData) ? scheduleData : scheduleData.schedule || [];
-
     document.getElementById('scheduleView').innerHTML = `
       <div class="schedule-header">
-        <h3>🌾 Rotational Grazing Plan</h3>
-        <p>28-day cycle · Next recommended: ${days[0]?.paddock_name || 'East Pasture'} · ML-optimised</p>
+        <h3>📅 Pasture Schedule</h3>
+        <p>${scheduleData.length} scheduled move${scheduleData.length !== 1 ? 's' : ''}</p>
       </div>
-      ${days.map((s, i) => `
-        <div class="schedule-day ${i === 0 ? 'today' : ''}">
-          <div class="schedule-day-num">${i === 0 ? '0' : i}</div>
-          <div class="schedule-day-info">
-            <div class="schedule-day-name">${s.name}</div>
-            <div class="schedule-day-paddock">📍 ${s.paddock_name}</div>
-            <div class="schedule-day-details">
-              ${s.cattle_count} cattle · ${s.duration_hours}h · ${s.grass_available} kg grass
+      ${scheduleData.map(sc => {
+        const targetPaddock = farmerPaddocksData.find(p => p.id === sc.paddock_id);
+        const isActive = targetPaddock && targetPaddock.status === 'occupied';
+        const statusLabel = isActive ? 'ACTIVE' : (sc.activated ? 'DONE' : 'PENDING');
+        const statusColor = isActive ? 'var(--accent)' : (sc.activated ? 'var(--muted)' : 'var(--accent2)');
+        const displayTime = (sc.start_time || '').replace('T', ' ');
+
+        return `
+          <div class="schedule-day ${isActive ? 'today' : ''}">
+            <div class="schedule-day-info">
+              <div class="schedule-day-name">${sc.paddock_name || 'Unknown Paddock'}</div>
+              <div class="schedule-day-details">${displayTime}</div>
             </div>
-          </div>
-          <div class="schedule-quality">
-            <div class="schedule-quality-num" style="color: ${s.grass_quality >= 80 ? 'var(--accent)' : s.grass_quality >= 65 ? 'var(--accent2)' : 'var(--danger)'}">${s.grass_quality}%</div>
-            <div class="schedule-quality-label">quality</div>
-          </div>
-        </div>`).join('')}`;
+            <div class="schedule-quality">
+              <div class="schedule-quality-num" style="color: ${statusColor}; font-size: 0.85rem;">${statusLabel}</div>
+            </div>
+          </div>`;
+      }).join('')}`;
   }
 
   // ── Master update ──
@@ -702,15 +692,16 @@
         farmerPaddocksData = data.paddocks || [];
         paddocksData = data.paddocks || [];
         updatePaddocksTab();
+        updateScheduleTab();
       })
       .catch(e => console.warn('Paddocks fetch error:', e));
   }
 
   // ── Fetch schedule ──
   function fetchSchedule() {
-    fetch(`${BACKEND_URL}/api/schedule`)
+    fetch(`${BACKEND_URL}/api/farmer/schedules`)
       .then(r => r.json())
-      .then(data => { scheduleData = data; updateScheduleTab(); })
+      .then(data => { scheduleData = data.schedules || []; updateScheduleTab(); })
       .catch(e => console.warn('Schedule fetch error:', e));
   }
 
@@ -758,6 +749,17 @@
     }
   });
 
+  socket.on('paddock_created', () => fetchPaddocks());
+  socket.on('paddock_updated', () => fetchPaddocks());
+  socket.on('paddock_deleted', () => fetchPaddocks());
+
+  socket.on('schedule_created', () => fetchSchedule());
+  socket.on('schedule_deleted', () => fetchSchedule());
+  socket.on('schedule_activated', () => {
+    fetchSchedule();
+    fetchPaddocks();
+  });
+
   // ── Initial load ──
   fetch(`${BACKEND_URL}/api/cattle`)
     .then(r => r.json())
@@ -769,7 +771,7 @@
     })
     .catch(e => console.warn('Initial load error:', e));
 
-  // Refresh paddocks and schedule every 30s
+  // Refresh paddocks and schedule every 30s (safety net alongside socket events)
   setInterval(fetchPaddocks, 30000);
   setInterval(fetchSchedule, 30000);
 </script>
